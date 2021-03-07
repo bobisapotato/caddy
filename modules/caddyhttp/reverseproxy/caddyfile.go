@@ -184,6 +184,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		if network != "" {
 			return caddy.JoinNetworkAddress(network, host, port), nil
 		}
+
+		// if the host is a placeholder, then we don't want to join with an empty port,
+		// because that would just append an extra ':' at the end of the address.
+		if port == "" && strings.Contains(host, "{") {
+			return host, nil
+		}
+
 		return net.JoinHostPort(host, port), nil
 	}
 
@@ -498,6 +505,25 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.BufferRequests = true
+
+			case "buffer_responses":
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+				h.BufferResponses = true
+
+			case "max_buffer_size":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				size, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.Errf("invalid size (bytes): %s", d.Val())
+				}
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+				h.MaxBufferSize = int64(size)
 
 			case "header_up":
 				var err error

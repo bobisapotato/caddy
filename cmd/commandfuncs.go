@@ -174,9 +174,6 @@ func cmdRun(fl Flags) (int, error) {
 		printEnvironment()
 	}
 
-	// TODO: This is TEMPORARY, until the RCs
-	moveStorage()
-
 	// load the config, depending on flags
 	var config []byte
 	var err error
@@ -282,7 +279,7 @@ func cmdRun(fl Flags) (int, error) {
 func cmdStop(fl Flags) (int, error) {
 	stopCmdAddrFlag := fl.String("address")
 
-	err := apiRequest(stopCmdAddrFlag, http.MethodPost, "/stop", nil)
+	err := apiRequest(stopCmdAddrFlag, http.MethodPost, "/stop", nil, nil)
 	if err != nil {
 		caddy.Log().Warn("failed using API to stop instance", zap.Error(err))
 		return caddy.ExitCodeFailedStartup, err
@@ -295,6 +292,7 @@ func cmdReload(fl Flags) (int, error) {
 	reloadCmdConfigFlag := fl.String("config")
 	reloadCmdConfigAdapterFlag := fl.String("adapter")
 	reloadCmdAddrFlag := fl.String("address")
+	reloadCmdForceFlag := fl.Bool("force")
 
 	if err := NotifyReloading(); err != nil {
 		caddy.Log().Error("unable to notify reloading to service manager", zap.Error(err))
@@ -328,7 +326,13 @@ func cmdReload(fl Flags) (int, error) {
 		adminAddr = tmpStruct.Admin.Listen
 	}
 
-	err = apiRequest(adminAddr, http.MethodPost, "/load", bytes.NewReader(config))
+	// optionally force a config reload
+	headers := make(http.Header)
+	if reloadCmdForceFlag {
+		headers.Set("Cache-Control", "must-revalidate")
+	}
+
+	err = apiRequest(adminAddr, http.MethodPost, "/load", headers, bytes.NewReader(config))
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("sending configuration to instance: %v", err)
 	}
@@ -347,8 +351,11 @@ func cmdBuildInfo(fl Flags) (int, error) {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("no build information")
 	}
 
-	fmt.Printf("path: %s\n", bi.Path)
-	fmt.Printf("main: %s %s %s\n", bi.Main.Path, bi.Main.Version, bi.Main.Sum)
+	fmt.Printf("go_version: %s\n", runtime.Version())
+	fmt.Printf("go_os:      %s\n", runtime.GOOS)
+	fmt.Printf("go_arch:    %s\n", runtime.GOARCH)
+	fmt.Printf("path:       %s\n", bi.Path)
+	fmt.Printf("main:       %s %s %s\n", bi.Main.Path, bi.Main.Version, bi.Main.Sum)
 	fmt.Println("dependencies:")
 
 	for _, goMod := range bi.Deps {
@@ -663,6 +670,7 @@ func cmdUpgrade(_ Flags) (int, error) {
 		defer destFile.Close()
 
 		l.Info("downloading binary", zap.String("source", urlStr), zap.String("destination", thisExecPath))
+
 		_, err = io.Copy(destFile, resp.Body)
 		if err != nil {
 			return fmt.Errorf("unable to download file: %v", err)
@@ -679,6 +687,8 @@ func cmdUpgrade(_ Flags) (int, error) {
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, err
 	}
+
+	l.Info("download successful; displaying new binary details", zap.String("location", thisExecPath))
 
 	// use the new binary to print out version and module info
 	fmt.Print("\nModule versions:\n\n")
@@ -827,7 +837,7 @@ func getModules() (standard, nonstandard, unknown []moduleInfo, err error) {
 // apiRequest makes an API request to the endpoint adminAddr with the
 // given HTTP method and request URI. If body is non-nil, it will be
 // assumed to be Content-Type application/json.
-func apiRequest(adminAddr, method, uri string, body io.Reader) error {
+func apiRequest(adminAddr, method, uri string, headers http.Header, body io.Reader) error {
 	// parse the admin address
 	if adminAddr == "" {
 		adminAddr = caddy.DefaultAdminListen
@@ -866,6 +876,9 @@ func apiRequest(adminAddr, method, uri string, body io.Reader) error {
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header[k] = v
 	}
 
 	// make an HTTP client that dials our network type, since admin

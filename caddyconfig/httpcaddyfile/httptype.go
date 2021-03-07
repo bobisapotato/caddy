@@ -17,6 +17,7 @@ package httpcaddyfile
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"reflect"
 	"regexp"
 	"sort"
@@ -27,11 +28,23 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddypki"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
 func init() {
 	caddyconfig.RegisterAdapter("caddyfile", caddyfile.Adapter{ServerType: ServerType{}})
+}
+
+// App represents the configuration for a non-standard
+// Caddy app module (e.g. third-party plugin) which was
+// parsed from a global options block.
+type App struct {
+	// The JSON key for the app being configured
+	Name string
+
+	// The raw app config as JSON
+	Value json.RawMessage
 }
 
 // ServerType can set up a config from an HTTP Caddyfile.
@@ -218,6 +231,12 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		return nil, warnings, err
 	}
 
+	// then make the PKI app
+	pkiApp, warnings, err := st.buildPKIApp(pairings, options, warnings)
+	if err != nil {
+		return nil, warnings, err
+	}
+
 	// extract any custom logs, and enforce configured levels
 	var customLogs []namedCustomLog
 	var hasDefaultLog bool
@@ -252,11 +271,25 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 
 	// annnd the top-level config, then we're done!
 	cfg := &caddy.Config{AppsRaw: make(caddy.ModuleMap)}
+
+	// loop through the configured options, and if any of
+	// them are an httpcaddyfile App, then we insert them
+	// into the config as raw Caddy apps
+	for _, opt := range options {
+		if app, ok := opt.(App); ok {
+			cfg.AppsRaw[app.Name] = app.Value
+		}
+	}
+
+	// insert the standard Caddy apps into the config
 	if len(httpApp.Servers) > 0 {
 		cfg.AppsRaw["http"] = caddyconfig.JSON(httpApp, &warnings)
 	}
 	if !reflect.DeepEqual(tlsApp, &caddytls.TLS{CertificatesRaw: make(caddy.ModuleMap)}) {
 		cfg.AppsRaw["tls"] = caddyconfig.JSON(tlsApp, &warnings)
+	}
+	if !reflect.DeepEqual(pkiApp, &caddypki.PKI{CAs: make(map[string]*caddypki.CA)}) {
+		cfg.AppsRaw["pki"] = caddyconfig.JSON(pkiApp, &warnings)
 	}
 	if storageCvtr, ok := options["storage"].(caddy.StorageConverter); ok {
 		cfg.StorageRaw = caddyconfig.JSONModuleObject(storageCvtr,
@@ -409,7 +442,7 @@ func (st *ServerType) serversFromPairings(
 			var iLongestHost, jLongestHost string
 			var iWildcardHost, jWildcardHost bool
 			for _, addr := range p.serverBlocks[i].keys {
-				if strings.Contains(addr.Host, "*") {
+				if strings.Contains(addr.Host, "*") || addr.Host == "" {
 					iWildcardHost = true
 				}
 				if specificity(addr.Host) > specificity(iLongestHost) {
@@ -420,7 +453,7 @@ func (st *ServerType) serversFromPairings(
 				}
 			}
 			for _, addr := range p.serverBlocks[j].keys {
-				if strings.Contains(addr.Host, "*") {
+				if strings.Contains(addr.Host, "*") || addr.Host == "" {
 					jWildcardHost = true
 				}
 				if specificity(addr.Host) > specificity(jLongestHost) {
@@ -430,9 +463,12 @@ func (st *ServerType) serversFromPairings(
 					jLongestPath = addr.Path
 				}
 			}
+			// catch-all blocks (blocks with no hostname) should always go
+			// last, even after blocks with wildcard hosts
+			if specificity(iLongestHost) == 0 {
+				return false
+			}
 			if specificity(jLongestHost) == 0 {
-				// catch-all blocks (blocks with no hostname) should always go
-				// last, even after blocks with wildcard hosts
 				return true
 			}
 			if iWildcardHost != jWildcardHost {
@@ -467,6 +503,13 @@ func (st *ServerType) serversFromPairings(
 			}
 
 			hosts := sblock.hostsFromKeys(false)
+
+			// emit warnings if user put unspecified IP addresses; they probably want the bind directive
+			for _, h := range hosts {
+				if h == "0.0.0.0" || h == "::" {
+					log.Printf("[WARNING] Site block has unspecified IP address %s which only matches requests having that Host header; you probably want the 'bind' directive to configure the socket", h)
+				}
+			}
 
 			// tls: connection policies
 			if cpVals, ok := sblock.pile["tls.connection_policy"]; ok {
